@@ -46,6 +46,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/metrics"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
@@ -60,18 +61,18 @@ func (cc *clientConn) handleStmtPrepare(ctx context.Context, sql string) error {
 	}
 	data := make([]byte, 4, 128)
 
-	//status ok
+	// status ok
 	data = append(data, 0)
-	//stmt id
+	// stmt id
 	data = dumpUint32(data, uint32(stmt.ID()))
-	//number columns
+	// number columns
 	data = dumpUint16(data, uint16(len(columns)))
-	//number params
+	// number params
 	data = dumpUint16(data, uint16(len(params)))
-	//filter [00]
+	// filter [00]
 	data = append(data, 0)
-	//warning count
-	data = append(data, 0, 0) //TODO support warning count
+	// warning count
+	data = append(data, 0, 0) // TODO support warning count
 
 	if err := cc.writePacket(data); err != nil {
 		return err
@@ -112,6 +113,11 @@ func (cc *clientConn) handleStmtPrepare(ctx context.Context, sql string) error {
 
 func (cc *clientConn) handleStmtExecute(ctx context.Context, data []byte) (err error) {
 	defer trace.StartRegion(ctx, "HandleStmtExecute").End()
+	defer func() {
+		if err != nil {
+			metrics.ExecuteErrorCounter.WithLabelValues(metrics.ExecuteErrorToLabel(err)).Inc()
+		}
+	}()
 	if len(data) < 9 {
 		return mysql.ErrMalformPacket
 	}

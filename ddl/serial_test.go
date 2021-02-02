@@ -650,9 +650,8 @@ func (s *testSerialSuite) TestRecoverTableByJobID(c *C) {
 	tk.MustExec(fmt.Sprintf(safePointSQL, timeBeforeDrop))
 
 	// if GC enable is not exists in mysql.tidb
-	_, err = tk.Exec(fmt.Sprintf("recover table by job %d", jobID))
-	c.Assert(err, NotNil)
-	c.Assert(err.Error(), Equals, "[ddl:-1]can not get 'tikv_gc_enable'")
+	tk.MustExec(fmt.Sprintf("recover table by job %d", jobID))
+	tk.MustExec("DROP TABLE t_recover")
 
 	err = gcutil.EnableGC(tk.Se)
 	c.Assert(err, IsNil)
@@ -894,7 +893,7 @@ func (s *testSerialSuite) TestCanceledJobTakeTime(c *C) {
 	once := sync.Once{}
 	hook.OnJobUpdatedExported = func(job *model.Job) {
 		once.Do(func() {
-			err := kv.RunInNewTxn(s.store, false, func(txn kv.Transaction) error {
+			err := kv.RunInNewTxn(context.Background(), s.store, false, func(ctx context.Context, txn kv.Transaction) error {
 				t := meta.NewMeta(txn)
 				return t.DropTableOrView(job.SchemaID, job.TableID, true)
 			})
@@ -1252,6 +1251,31 @@ func (s *testSerialSuite) TestAutoRandomIncBitsIncrementAndOffset(c *C) {
 		}
 		assertIncBitsValues(tc.results...)
 	}
+}
+
+func (s *testSerialSuite) TestAutoRandomWithPreSplitRegion(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("create database if not exists auto_random_db;")
+	defer tk.MustExec("drop database if exists auto_random_db;")
+	tk.MustExec("use auto_random_db;")
+	tk.MustExec("drop table if exists t;")
+
+	ConfigTestUtils.SetupAutoRandomTestConfig()
+	defer ConfigTestUtils.RestoreAutoRandomTestConfig()
+	origin := atomic.LoadUint32(&ddl.EnableSplitTableRegion)
+	atomic.StoreUint32(&ddl.EnableSplitTableRegion, 1)
+	defer atomic.StoreUint32(&ddl.EnableSplitTableRegion, origin)
+	tk.MustExec("set @@global.tidb_scatter_region=1;")
+
+	// Test pre-split table region for auto_random table.
+	tk.MustExec("create table t (a bigint auto_random(2) primary key, b int) pre_split_regions=2;")
+	re := tk.MustQuery("show table t regions;")
+	rows := re.Rows()
+	c.Assert(len(rows), Equals, 4)
+	tbl := testGetTableByName(c, tk.Se, "auto_random_db", "t")
+	c.Assert(rows[1][1], Equals, fmt.Sprintf("t_%d_r_2305843009213693952", tbl.Meta().ID))
+	c.Assert(rows[2][1], Equals, fmt.Sprintf("t_%d_r_4611686018427387904", tbl.Meta().ID))
+	c.Assert(rows[3][1], Equals, fmt.Sprintf("t_%d_r_6917529027641081856", tbl.Meta().ID))
 }
 
 func (s *testSerialSuite) TestModifyingColumn4NewCollations(c *C) {

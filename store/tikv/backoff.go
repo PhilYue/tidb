@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,10 +26,9 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/store/tikv/logutil"
+	"github.com/pingcap/tidb/store/tikv/metrics"
 	"github.com/pingcap/tidb/util/execdetails"
-	"github.com/pingcap/tidb/util/fastrand"
-	"github.com/pingcap/tidb/util/logutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -58,7 +58,8 @@ var (
 
 func (t backoffType) metric() prometheus.Observer {
 	switch t {
-	case boTiKVRPC:
+	// TODO: distinguish tikv and tiflash in metrics
+	case boTiKVRPC, boTiFlashRPC:
 		return tikvBackoffHistogramRPC
 	case BoTxnLock:
 		return tikvBackoffHistogramLock
@@ -68,7 +69,7 @@ func (t backoffType) metric() prometheus.Observer {
 		return tikvBackoffHistogramPD
 	case BoRegionMiss:
 		return tikvBackoffHistogramRegionMiss
-	case boServerBusy:
+	case boTiKVServerBusy, boTiFlashServerBusy:
 		return tikvBackoffHistogramServerBusy
 	case boStaleCmd:
 		return tikvBackoffHistogramStaleCmd
@@ -93,12 +94,12 @@ func NewBackoffFn(base, cap, jitter int) func(ctx context.Context, maxSleepMs in
 			sleep = expo(base, cap, attempts)
 		case FullJitter:
 			v := expo(base, cap, attempts)
-			sleep = int(fastrand.Uint32N(uint32(v)))
+			sleep = rand.Intn(v)
 		case EqualJitter:
 			v := expo(base, cap, attempts)
-			sleep = v/2 + int(fastrand.Uint32N(uint32(v/2)))
+			sleep = v/2 + rand.Intn(v/2)
 		case DecorrJitter:
-			sleep = int(math.Min(float64(cap), float64(base+int(fastrand.Uint32N(uint32(lastSleep*3-base))))))
+			sleep = int(math.Min(float64(cap), float64(base+rand.Intn(lastSleep*3-base))))
 		}
 		logutil.BgLogger().Debug("backoff",
 			zap.Int("base", base),
@@ -129,11 +130,13 @@ type backoffType int
 // Back off types.
 const (
 	boTiKVRPC backoffType = iota
+	boTiFlashRPC
 	BoTxnLock
 	boTxnLockFast
 	BoPDRPC
 	BoRegionMiss
-	boServerBusy
+	boTiKVServerBusy
+	boTiFlashServerBusy
 	boTxnNotFound
 	boStaleCmd
 	boMaxTsNotSynced
@@ -144,7 +147,7 @@ func (t backoffType) createFn(vars *kv.Variables) func(context.Context, int) int
 		vars.Hook(t.String(), vars)
 	}
 	switch t {
-	case boTiKVRPC:
+	case boTiKVRPC, boTiFlashRPC:
 		return NewBackoffFn(100, 2000, EqualJitter)
 	case BoTxnLock:
 		return NewBackoffFn(200, 3000, EqualJitter)
@@ -157,7 +160,7 @@ func (t backoffType) createFn(vars *kv.Variables) func(context.Context, int) int
 		return NewBackoffFn(2, 500, NoJitter)
 	case boTxnNotFound:
 		return NewBackoffFn(2, 500, NoJitter)
-	case boServerBusy:
+	case boTiKVServerBusy, boTiFlashServerBusy:
 		return NewBackoffFn(2000, 10000, EqualJitter)
 	case boStaleCmd:
 		return NewBackoffFn(2, 1000, NoJitter)
@@ -171,6 +174,8 @@ func (t backoffType) String() string {
 	switch t {
 	case boTiKVRPC:
 		return "tikvRPC"
+	case boTiFlashRPC:
+		return "tiflashRPC"
 	case BoTxnLock:
 		return "txnLock"
 	case boTxnLockFast:
@@ -179,8 +184,10 @@ func (t backoffType) String() string {
 		return "pdRPC"
 	case BoRegionMiss:
 		return "regionMiss"
-	case boServerBusy:
-		return "serverBusy"
+	case boTiKVServerBusy:
+		return "tikvServerBusy"
+	case boTiFlashServerBusy:
+		return "tiflashServerBusy"
 	case boStaleCmd:
 		return "staleCommand"
 	case boTxnNotFound:
@@ -195,14 +202,18 @@ func (t backoffType) TError() error {
 	switch t {
 	case boTiKVRPC:
 		return ErrTiKVServerTimeout
+	case boTiFlashRPC:
+		return ErrTiFlashServerTimeout
 	case BoTxnLock, boTxnLockFast, boTxnNotFound:
 		return ErrResolveLockTimeout
 	case BoPDRPC:
 		return ErrPDServerTimeout
 	case BoRegionMiss:
 		return ErrRegionUnavailable
-	case boServerBusy:
+	case boTiKVServerBusy:
 		return ErrTiKVServerBusy
+	case boTiFlashServerBusy:
+		return ErrTiFlashServerBusy
 	case boStaleCmd:
 		return ErrTiKVStaleCommand
 	case boMaxTsNotSynced:
@@ -213,7 +224,7 @@ func (t backoffType) TError() error {
 
 // Maximum total sleep time(in ms) for kv/cop commands.
 const (
-	GetMemberInfoBackoff           = 5000
+	GetAllMembersBackoff           = 5000
 	copBuildTaskMaxBackoff         = 5000
 	tsoMaxBackoff                  = 15000
 	scannerNextMaxBackoff          = 20000
@@ -227,7 +238,6 @@ const (
 	rawkvMaxBackoff                = 20000
 	splitRegionBackoff             = 20000
 	maxSplitRegionsBackoff         = 120000
-	scatterRegionBackoff           = 20000
 	waitScatterRegionFinishBackoff = 120000
 	locateRegionMaxBackoff         = 20000
 	pessimisticLockMaxBackoff      = 20000
